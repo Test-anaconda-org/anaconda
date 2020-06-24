@@ -36,6 +36,20 @@ Checkout out our easy guide at: https://anaconda-installer.readthedocs.io/en/lat
 
 Or help to translate: https://translate.fedoraproject.org/engage/anaconda/
 
+Depending on where you want to make your contribution please choose your correct branch based on the table below.
+
++-------------------+--------------+
+| Fedora Rawhide    | master       |
++-------------------+--------------+
+| Fedora XX         | fXX-devel    |
++-------------------+--------------+
+| RHEL-8 / CentOS 8 | rhel-8       |
++-------------------+--------------+
+| RHEL-7 / CentOS 7 | rhel7-branch |
++-------------------+--------------+
+| RHEL-6 / CentOS 6 | rhel6-branch |
++-------------------+--------------+
+
 
 I want to do an automated installation!
 ---------------------------------------
