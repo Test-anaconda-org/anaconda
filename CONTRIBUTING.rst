@@ -7,6 +7,8 @@ help with implementing changes in Anaconda, please follow our
 an `addon guide <http://rhinstaller.github.io/anaconda-addon-development-guide/index.html>`_ to create Anaconda addon.
 
 How to run make commands
+
+
 ------------------------
 
 Anaconda has plenty of dependencies and because of that it's hard to set environment to
