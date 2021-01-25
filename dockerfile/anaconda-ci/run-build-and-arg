@@ -6,6 +6,8 @@ cp -r /anaconda /tmp/
 cd /tmp/anaconda
 rm -rf test-logs
 
+echo "test"
+
 ./autogen.sh
 ./configure
 make
