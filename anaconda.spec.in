@@ -26,6 +26,8 @@ Patch2: 0003-Do-not-require-inst.-prefixes-for-Anaconda-boot-argu.patch
 # Versions of required components (done so we make sure the buildrequires
 # match the requires versions of things).
 
+%define test test
+
 %if ! 0%{?rhel}
 %define blivetguiver 2.1.12-1
 %endif
