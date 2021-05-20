@@ -205,7 +205,7 @@ class PayloadManager(object):
         if onlyOnChange:
             log.debug("Testing repositories availability")
             self._set_state(PayloadState.VERIFYING_AVAILABILITY)
-            if payload.verify_available_repositories():
+            if payload.dnf_manager.verify_repomd_hashes():
                 log.debug("Payload isn't restarted, repositories are still available.")
                 self._set_state(PayloadState.FINISHED)
                 return
@@ -213,10 +213,14 @@ class PayloadManager(object):
         # Keep setting up package-based repositories
         # Download package metadata
         self._set_state(PayloadState.DOWNLOADING_PKG_METADATA)
+
+        # FIXME: This import is a temporary workaround. Use a DBus error instead.
+        from pyanaconda.modules.payloads.payload.dnf.dnf_manager import DNFManagerError
+
         try:
             payload.update_base_repo(fallback=fallback, checkmount=checkmount)
             payload.add_driver_repos()
-        except (OSError, DBusError, PayloadError) as e:
+        except (OSError, DBusError, PayloadError, DNFManagerError) as e:
             log.error("PayloadError: %s", e)
             self._error = self.ERROR_SETUP
             self._set_state(PayloadState.ERROR)
@@ -236,7 +240,7 @@ class PayloadManager(object):
             return
 
         # run payload specific post configuration tasks
-        payload.post_setup()
+        payload.dnf_manager.load_repomd_hashes()
 
         self._set_state(PayloadState.FINISHED)
 

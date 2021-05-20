@@ -33,7 +33,6 @@ ADDON_PATHS = ["/usr/share/anaconda/addons"]
 from pyanaconda import product
 productName = product.productName
 productVersion = product.productVersion
-productArch = product.productArch
 isFinal = product.isFinal
 
 # for use in device names, eg: "fedora", "rhel"
@@ -57,7 +56,8 @@ BASE_REPO_NAME = "anaconda"
 DEFAULT_REPOS = [productName.split('-')[0].lower(),
                  "fedora-modular-server",
                  "rawhide",
-                 "BaseOS"]
+                 "BaseOS",  # Used by RHEL
+                 "baseos"]  # Used by CentOS Stream
 
 DBUS_ANACONDA_SESSION_ADDRESS = "DBUS_ANACONDA_SESSION_BUS_ADDRESS"
 

@@ -33,6 +33,8 @@ import sys
 import types
 import inspect
 import functools
+import importlib.util
+import importlib.machinery
 import blivet.arch
 
 import requests
@@ -45,7 +47,7 @@ from pyanaconda.core.process_watchers import WatchProcesses
 from pyanaconda.core.constants import DRACUT_SHUTDOWN_EJECT, \
     IPMI_ABORTED, X_TIMEOUT, TAINT_HARDWARE_UNSUPPORTED, TAINT_SUPPORT_REMOVED, \
     WARNING_HARDWARE_UNSUPPORTED, WARNING_SUPPORT_REMOVED
-from pyanaconda.errors import RemovedModuleError, ExitError
+from pyanaconda.errors import RemovedModuleError
 
 from pyanaconda.anaconda_logging import program_log_lock
 from pyanaconda.anaconda_loggers import get_module_logger, get_program_logger
@@ -202,6 +204,19 @@ def startProgram(argv, root='/', stdin=None, stdout=subprocess.PIPE, stderr=subp
                             preexec_fn=preexec, cwd=root, env=env, **kwargs)
 
 
+class X11Status:
+    """Status of Xorg launch.
+
+    Values of an instance can be modified from the handler functions.
+    """
+    def __init__(self):
+        self.started = False
+        self.timed_out = False
+
+    def needs_waiting(self):
+        return not (self.started or self.timed_out)
+
+
 def startX(argv, output_redirect=None, timeout=X_TIMEOUT):
     """ Start X and return once X is ready to accept connections.
 
@@ -215,28 +230,36 @@ def startX(argv, output_redirect=None, timeout=X_TIMEOUT):
         :param output_redirect: file or file descriptor to redirect stdout and stderr to
         :param timeout: Number of seconds to timing out.
     """
-    # Use a list so the value can be modified from the handler function
-    x11_started = [False]
+    x11_status = X11Status()
 
-    def sigusr1_handler(num, frame):
+    # Handle successful start before timeout
+    def sigusr1_success_handler(num, frame):
         log.debug("X server has signalled a successful start.")
-        x11_started[0] = True
+        x11_status.started = True
 
     # Fail after, let's say a minute, in case something weird happens
     # and we don't receive SIGUSR1
     def sigalrm_handler(num, frame):
         # Check that it didn't make it under the wire
-        if x11_started[0]:
+        if x11_status.started:
             return
+        x11_status.timed_out = True
         log.error("Timeout trying to start %s", argv[0])
-        raise ExitError("Timeout trying to start %s" % argv[0])
 
-    # preexec_fn to add the SIGUSR1 handler in the child
+    # Handle delayed start after timeout
+    def sigusr1_too_late_handler(num, frame):
+        if x11_status.timed_out:
+            log.debug("SIGUSR1 received after X server timeout. Switching back to tty1. "
+                      "SIGUSR1 now again initiates test of exception reporting.")
+            signal.signal(signal.SIGUSR1, old_sigusr1_handler)
+
+    # preexec_fn to add the SIGUSR1 handler in the child we are starting
+    # see man page XServer(1), section "signals"
     def sigusr1_preexec():
         signal.signal(signal.SIGUSR1, signal.SIG_IGN)
 
     try:
-        old_sigusr1_handler = signal.signal(signal.SIGUSR1, sigusr1_handler)
+        old_sigusr1_handler = signal.signal(signal.SIGUSR1, sigusr1_success_handler)
         old_sigalrm_handler = signal.signal(signal.SIGALRM, sigalrm_handler)
 
         # Start the timer
@@ -247,15 +270,30 @@ def startX(argv, output_redirect=None, timeout=X_TIMEOUT):
                                  preexec_fn=sigusr1_preexec)
         WatchProcesses.watch_process(childproc, argv[0])
 
-        # Wait for SIGUSR1
-        while not x11_started[0]:
+        # Wait for SIGUSR1 or SIGALRM
+        while x11_status.needs_waiting():
             signal.pause()
 
     finally:
-        # Put everything back where it was
+        # Stop the timer
         signal.alarm(0)
-        signal.signal(signal.SIGUSR1, old_sigusr1_handler)
         signal.signal(signal.SIGALRM, old_sigalrm_handler)
+
+        # Handle outcome of X start attempt
+        if x11_status.started:
+            signal.signal(signal.SIGUSR1, old_sigusr1_handler)
+        elif x11_status.timed_out:
+            signal.signal(signal.SIGUSR1, sigusr1_too_late_handler)
+            # Kill Xorg because from now on we will not use it. It will exit only after sending
+            # the signal, but at least we don't have to track that.
+            WatchProcesses.unwatch_process(childproc)
+            childproc.terminate()
+            log.debug("Exception handler test suspended to prevent accidental activation by "
+                      "delayed Xorg start. Next SIGUSR1 will be handled as delayed Xorg start.")
+            # Raise an exception to notify the caller that things went wrong. This affects
+            # particularly pyanaconda.display.do_startup_x11_actions(), where the window manager
+            # is started immediately after this. The WM would just wait forever.
+            raise TimeoutError("Timeout trying to start %s" % argv[0])
 
 
 def _run_program(argv, root='/', stdin=None, stdout=None, env_prune=None, log_output=True,
@@ -1179,8 +1217,6 @@ def collect(module_pattern, path, pred):
        :param pred: function which marks classes as good to import
        :type pred: function with one argument returning True or False
     """
-    import imp
-
     retval = []
     try:
         contents = os.listdir(path)
@@ -1201,12 +1237,19 @@ def collect(module_pattern, path, pred):
         except ValueError:
             mod_name = module_file
 
-        mod_info = None
         module = None
         module_path = None
 
         try:
-            (fo, module_path, module_flags) = imp.find_module(mod_name, [path])
+            # see what can be found
+            spec = importlib.machinery.PathFinder.find_spec(mod_name, [path])
+            module_path = spec.origin
+            candidate_name, dot, found_ext = module_path.rpartition(".")
+            if not dot:
+                continue
+            found_ext = dot + found_ext
+
+            # see what is already loaded
             module = sys.modules.get(module_pattern % mod_name)
 
             # do not load module if any module with the same name
@@ -1236,15 +1279,15 @@ def collect(module_pattern, path, pred):
                             sys.modules[module_part_name] = module_part
 
                     # load the collected module
-                    module = imp.load_module(module_pattern % mod_name,
-                                             fo, module_path, module_flags)
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[mod_name] = module
+                    spec.loader.exec_module(module)
 
             # get the filenames without the extensions so we can compare those
             # with the .py[co]? equivalence in mind
             # - we do not have to care about files without extension as the
             #   condition at the beginning of the for loop filters out those
-            # - module_flags[0] contains the extension of the module imp found
-            candidate_name = module_path[:module_path.rindex(module_flags[0])]
+            # - found_ext contains the extension of the module importlib found
             loaded_name, loaded_ext = module.__file__.rsplit(".", 1)
 
             # restore the extension dot eaten by split
@@ -1258,12 +1301,12 @@ def collect(module_pattern, path, pred):
 
             # if the candidate file is .py[co]? and the loaded is not (.so)
             # skip the file as well
-            if module_flags[0].startswith(".py") and not loaded_ext.startswith(".py"):
+            if found_ext.startswith(".py") and not loaded_ext.startswith(".py"):
                 continue
 
             # if the candidate file is not .py[co]? and the loaded is
             # skip the file as well
-            if not module_flags[0].startswith(".py") and loaded_ext.startswith(".py"):
+            if not found_ext.startswith(".py") and loaded_ext.startswith(".py"):
                 continue
 
         except RemovedModuleError:
@@ -1277,9 +1320,6 @@ def collect(module_pattern, path, pred):
                 raise
             log.error("Failed to import module %s from path %s in collect: %s", mod_name, module_path, imperr)
             continue
-        finally:
-            if mod_info and mod_info[0]:  # pylint: disable=unsubscriptable-object
-                mod_info[0].close()  # pylint: disable=unsubscriptable-object
 
         p = lambda obj: inspect.isclass(obj) and pred(obj)
 

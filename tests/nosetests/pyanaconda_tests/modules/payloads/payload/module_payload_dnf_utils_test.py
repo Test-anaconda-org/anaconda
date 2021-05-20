@@ -17,7 +17,7 @@
 #
 import unittest
 from textwrap import dedent
-from unittest.mock import patch, Mock, PropertyMock
+from unittest.mock import patch, Mock
 
 from blivet.size import Size
 
@@ -27,9 +27,8 @@ from pyanaconda.modules.common.constants.services import STORAGE
 from pyanaconda.modules.common.structures.packages import PackagesSelectionData
 from pyanaconda.modules.payloads.payload.dnf.dnf_manager import DNFManager
 from pyanaconda.modules.payloads.payload.dnf.utils import get_kernel_package, \
-    get_product_release_version, get_default_environment, get_installation_specs, \
-    get_kernel_version_list, pick_download_location, calculate_required_space, \
-    get_free_space_map, _pick_mount_points
+    get_product_release_version, get_installation_specs, get_kernel_version_list, \
+    pick_download_location, calculate_required_space, get_free_space_map, _pick_mount_points
 
 from tests.nosetests.pyanaconda_tests import patch_dbus_get_proxy_with_cache
 
@@ -38,42 +37,44 @@ class DNFUtilsPackagesTestCase(unittest.TestCase):
 
     def get_kernel_package_excluded_test(self):
         """Test the get_kernel_package function with kernel excluded."""
-        kernel = get_kernel_package(dnf_base=Mock(), exclude_list=["kernel"])
+        kernel = get_kernel_package(Mock(), exclude_list=["kernel"])
         self.assertEqual(kernel, None)
 
-    @patch("pyanaconda.modules.payloads.payload.dnf.utils.dnf")
-    def get_kernel_package_installable_test(self, mock_dnf):
-        """Test the get_kernel_package function without installable packages."""
-        subject = mock_dnf.subject.Subject.return_value
-        subject.get_best_query.return_value = False
+    def get_kernel_package_unavailable_test(self):
+        """Test the get_kernel_package function with unavailable packages."""
+        dnf_manager = Mock(spec=DNFManager)
+        dnf_manager.is_package_available.return_value = False
 
         with self.assertLogs(level="ERROR") as cm:
-            kernel = get_kernel_package(dnf_base=Mock(), exclude_list=[])
+            kernel = get_kernel_package(dnf_manager, exclude_list=[])
 
-        msg = "kernel: failed to select a kernel"
-        self.assertTrue(any(map(lambda x: msg in x, cm.output)))
+        msg = "Failed to select a kernel"
+        self.assertIn(msg, "\n".join(cm.output))
         self.assertEqual(kernel, None)
 
-    @patch("pyanaconda.modules.payloads.payload.dnf.utils.dnf")
     @patch("pyanaconda.modules.payloads.payload.dnf.utils.is_lpae_available")
-    def get_kernel_package_lpae_test(self, is_lpae, mock_dnf):
+    def get_kernel_package_lpae_test(self, is_lpae):
         """Test the get_kernel_package function with LPAE."""
-        subject = mock_dnf.subject.Subject.return_value
-        subject.get_best_query.return_value = True
         is_lpae.return_value = True
 
-        kernel = get_kernel_package(dnf_base=Mock(), exclude_list=[])
+        dnf_manager = Mock(spec=DNFManager)
+        dnf_manager.is_package_available.return_value = True
+
+        kernel = get_kernel_package(dnf_manager, exclude_list=[])
         self.assertEqual(kernel, "kernel-lpae")
 
-    @patch("pyanaconda.modules.payloads.payload.dnf.utils.dnf")
+        kernel = get_kernel_package(dnf_manager, exclude_list=["kernel-lpae"])
+        self.assertEqual(kernel, "kernel")
+
     @patch("pyanaconda.modules.payloads.payload.dnf.utils.is_lpae_available")
-    def get_kernel_package_test(self, is_lpae, mock_dnf):
+    def get_kernel_package_test(self, is_lpae):
         """Test the get_kernel_package function."""
-        subject = mock_dnf.subject.Subject.return_value
-        subject.get_best_query.return_value = True
         is_lpae.return_value = False
 
-        kernel = get_kernel_package(dnf_base=Mock(), exclude_list=[])
+        dnf_manager = Mock(spec=DNFManager)
+        dnf_manager.is_package_available.return_value = True
+
+        kernel = get_kernel_package(dnf_manager, exclude_list=[])
         self.assertEqual(kernel, "kernel")
 
     @patch("pyanaconda.modules.payloads.payload.dnf.utils.productVersion", "invalid")
@@ -90,19 +91,6 @@ class DNFUtilsPackagesTestCase(unittest.TestCase):
     def get_product_release_version_dot_test(self):
         """Test the get_product_release_version function with a dot."""
         self.assertEqual(get_product_release_version(), "7.4")
-
-    @patch.object(DNFManager, 'environments', new_callable=PropertyMock)
-    def get_default_environment_test(self, mock_environments):
-        """Test the get_default_environment function"""
-        mock_environments.return_value = []
-        self.assertEqual(get_default_environment(DNFManager()), None)
-
-        mock_environments.return_value = [
-            "environment-1",
-            "environment-2",
-            "environment-3",
-        ]
-        self.assertEqual(get_default_environment(DNFManager()), "environment-1")
 
     def get_installation_specs_default_test(self):
         """Test the get_installation_specs function with defaults."""

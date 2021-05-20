@@ -21,26 +21,8 @@ class PayloadError(Exception):
     pass
 
 
-class MetadataError(PayloadError):
-    pass
-
-
 # setup
 class PayloadSetupError(PayloadError):
-    pass
-
-
-# software selection
-class NoSuchGroup(PayloadError):
-    def __init__(self, group):
-        super().__init__(group)
-        self.group = group
-
-    def __str__(self):
-        return "The group '{}' does not exist".format(self.group)
-
-
-class DependencyError(PayloadError):
     pass
 
 

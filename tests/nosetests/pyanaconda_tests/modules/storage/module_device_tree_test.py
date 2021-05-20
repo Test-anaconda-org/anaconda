@@ -26,13 +26,14 @@ from tests.nosetests.pyanaconda_tests import patch_dbus_publish_object, check_ta
 from blivet.devices import StorageDevice, DiskDevice, DASDDevice, ZFCPDiskDevice, PartitionDevice, \
     LUKSDevice, iScsiDiskDevice, NVDIMMNamespaceDevice, FcoeDiskDevice, OpticalDevice
 from blivet.errors import StorageError, FSError
-from blivet.formats import get_format
+from blivet.formats import get_format, device_formats
 from blivet.formats.fs import FS, Iso9660FS
 from blivet.formats.luks import LUKS
 from blivet.size import Size
 
 from dasbus.typing import *  # pylint: disable=wildcard-import
 from pyanaconda.modules.common.errors.storage import UnknownDeviceError, MountFilesystemError
+from pyanaconda.modules.common.structures.storage import DeviceFormatData
 from pyanaconda.modules.storage.devicetree import DeviceTreeModule, create_storage
 from pyanaconda.modules.storage.devicetree.devicetree_interface import DeviceTreeInterface
 from pyanaconda.modules.storage.devicetree.populate import FindDevicesTask
@@ -314,6 +315,14 @@ class DeviceTreeInterfaceTestCase(unittest.TestCase):
             'description': get_variant(Str, 'swap'),
         })
 
+    def get_all_format_type_data_test(self):
+        """Test GetFormatTypeData for all format types."""
+        for format_type in device_formats:
+            data = DeviceFormatData.from_structure(
+                self.interface.GetFormatTypeData(format_type)
+            )
+            self.assertEqual(format_type or "", data.type)
+
     def get_actions_test(self):
         """Test GetActions."""
         self.assertEqual(self.interface.GetActions(), [])
@@ -346,6 +355,7 @@ class DeviceTreeInterfaceTestCase(unittest.TestCase):
 
         dev2 = StorageDevice(
             "dev2",
+            fmt=get_format("ext4", mountpoint="/boot"),
             size=Size("500 MiB"),
             serial="SERIAL",
             exists=True
@@ -361,7 +371,10 @@ class DeviceTreeInterfaceTestCase(unittest.TestCase):
             'object-description': 'blivet',
             'device-name': 'dev2',
             'device-description': 'dev2',
-            'attrs': {"serial": "SERIAL"},
+            'attrs': {
+                'serial': 'SERIAL',
+                'mount-point': '/boot'
+            },
         }
 
         self.assertEqual(get_native(self.interface.GetActions()), [
@@ -386,7 +399,7 @@ class DeviceTreeInterfaceTestCase(unittest.TestCase):
             'object-description': 'partition',
             'device-name': 'dev3',
             'device-description': 'dev3 on VENDOR MODEL',
-            'attrs': {},
+            'attrs': {'mount-point': '/home'},
         }
 
         action_4 = {

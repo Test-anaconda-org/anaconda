@@ -18,31 +18,25 @@
 #
 import configparser
 import os
-import sys
-import threading
 import dnf.exceptions
 import dnf.repo
-import libdnf.conf
 
 from glob import glob
 
+from pyanaconda.modules.common.errors.installation import NonCriticalInstallationError, \
+    InstallationError
 from pyanaconda.modules.common.structures.payload import RepoConfigurationData
 from pyanaconda.modules.common.structures.packages import PackagesConfigurationData, \
     PackagesSelectionData
 from pyanaconda.modules.payloads.payload.dnf.initialization import configure_dnf_logging
 from pyanaconda.modules.payloads.payload.dnf.installation import ImportRPMKeysTask, \
     SetRPMMacrosTask, DownloadPackagesTask, InstallPackagesTask, PrepareDownloadLocationTask, \
-    CleanUpDownloadLocationTask
-from pyanaconda.modules.payloads.payload.dnf.requirements import collect_language_requirements, \
-    collect_platform_requirements, collect_driver_disk_requirements, collect_remote_requirements, \
-    apply_requirements
-from pyanaconda.modules.payloads.payload.dnf.utils import get_kernel_package, \
-    get_product_release_version, get_default_environment, get_installation_specs, \
+    CleanUpDownloadLocationTask, ResolvePackagesTask
+from pyanaconda.modules.payloads.payload.dnf.utils import get_product_release_version, \
     get_kernel_version_list, calculate_required_space
-from pyanaconda.modules.payloads.payload.dnf.dnf_manager import DNFManager
+from pyanaconda.modules.payloads.payload.dnf.dnf_manager import DNFManager, DNFManagerError
 from pyanaconda.payload.source import SourceFactory, PayloadSourceTypeUnrecognized
 
-from pyanaconda import errors as errors
 from pyanaconda.anaconda_loggers import get_packaging_logger
 from pyanaconda.core import constants, util
 from pyanaconda.core.configuration.anaconda import conf
@@ -51,6 +45,7 @@ from pyanaconda.core.constants import INSTALL_TREE, ISO_DIR, PAYLOAD_TYPE_DNF, \
     URL_TYPE_METALINK, SOURCE_REPO_FILE_TYPES, SOURCE_TYPE_CDN, MULTILIB_POLICY_ALL
 from pyanaconda.core.i18n import N_
 from pyanaconda.core.payload import ProxyString, ProxyStringError
+from pyanaconda.errors import errorHandler as error_handler, ERROR_RAISE
 from pyanaconda.flags import flags
 from pyanaconda.kickstart import RepoData
 from pyanaconda.modules.common.constants.services import SUBSCRIPTION
@@ -59,9 +54,7 @@ from pyanaconda.modules.common.errors.storage import DeviceSetupError, MountFile
 from pyanaconda.modules.common.util import is_module_available
 from pyanaconda.payload import utils as payload_utils
 from pyanaconda.payload.base import Payload
-from pyanaconda.payload.dnf.repomd import RepoMDMetaHash
-from pyanaconda.payload.errors import MetadataError, PayloadError, NoSuchGroup, DependencyError, \
-    PayloadSetupError
+from pyanaconda.payload.errors import PayloadError, PayloadSetupError
 from pyanaconda.payload.image import find_first_iso_image, find_optical_install_media
 from pyanaconda.payload.install_tree_metadata import InstallTreeMetadata, FileNotDownloadedError
 from pyanaconda.product import productName, productVersion
@@ -90,13 +83,6 @@ class DNFPayload(Payload):
         self.tx_id = None
         self._install_tree_metadata = None
 
-        # Used to determine which add-ons to display for each environment.
-        # The dictionary keys are environment IDs. The dictionary values are two-tuples
-        # consisting of lists of add-on group IDs. The first list is the add-ons specific
-        # to the environment, and the second list is the other add-ons possible for the
-        # environment.
-        self._environment_addons = {}
-
         self._dnf_manager = DNFManager()
         self._updates_enabled = True
 
@@ -107,17 +93,10 @@ class DNFPayload(Payload):
         # This will create a default source if there is none.
         self._configure()
 
-        # Protect access to _base.repos to ensure that the dictionary is not
-        # modified while another thread is attempting to iterate over it. The
-        # lock only needs to be held during operations that change the number
-        # of repos or that iterate over the repos.
-        self._repos_lock = threading.RLock()
-
-        # save repomd metadata
-        self._repoMD_list = []
-
-        # Additional packages required by installer based on used features
-        self._requirements = []
+    @property
+    def dnf_manager(self):
+        """The DNF manager."""
+        return self._dnf_manager
 
     @property
     def _base(self):
@@ -126,6 +105,14 @@ class DNFPayload(Payload):
         FIXME: This is a temporary property.
         """
         return self._dnf_manager._base
+
+    @property
+    def _repos_lock(self):
+        """A lock for a dictionary of DNF repositories.
+
+        FIXME: This is a temporary property.
+        """
+        return self._dnf_manager._lock
 
     def set_from_opts(self, opts):
         """Set the payload from the Anaconda cmdline options.
@@ -231,7 +218,6 @@ class DNFPayload(Payload):
 
     def unsetup(self):
         self._configure()
-        self._repoMD_list = []
         self._install_tree_metadata = None
         tear_down_sources(self.proxy)
 
@@ -265,66 +251,7 @@ class DNFPayload(Payload):
         log.debug("Source doesn't require network for installation")
         return False
 
-    def _replace_vars(self, url):
-        """Replace url variables with their values.
-
-        :param url: url string to do replacement on
-        :type url:  string
-        :returns:   string with variables substituted
-        :rtype:     string or None
-
-        Currently supports $releasever and $basearch.
-        """
-        if url:
-            return libdnf.conf.ConfigParser.substitute(url, self._base.conf.substitutions)
-
-        return None
-
-    def _process_module_command(self):
-        """Enable/disable modules (if any)."""
-        # Get the packages configuration data.
-        selection = self.get_packages_selection()
-
-        try:
-            self._dnf_manager.disable_modules(selection.disabled_modules)
-        except dnf.exceptions.MarkingErrors as e:
-            self._handle_marking_error(e)
-
-        try:
-            self._dnf_manager.enable_modules(selection.modules)
-        except dnf.exceptions.MarkingErrors as e:
-            self._handle_marking_error(e)
-
-    def _apply_selections(self):
-        log.debug("applying DNF package/group/module selection")
-
-        # Get the packages configuration data.
-        selection = self.get_packages_selection()
-
-        # Get the default environment.
-        default_environment = get_default_environment(self._dnf_manager)
-
-        # Get the installation specs.
-        include_list, exclude_list = get_installation_specs(
-            selection, default_environment
-        )
-
-        # Add the kernel package.
-        kernel_package = get_kernel_package(self._base, exclude_list)
-
-        if kernel_package:
-            include_list.append(kernel_package)
-
-        # Apply requirements.
-        apply_requirements(self._requirements, include_list, exclude_list)
-
-        # Apply specs.
-        try:
-            self._dnf_manager.apply_specs(include_list, exclude_list)
-        except dnf.exceptions.MarkingErrors as e:
-            self._handle_marking_error(e)
-
-    def _bump_tx_id(self):
+    def bump_tx_id(self):
         if self.tx_id is None:
             self.tx_id = 1
         else:
@@ -353,18 +280,6 @@ class DNFPayload(Payload):
         self._dnf_manager.configure_base(self.get_packages_configuration())
         self._dnf_manager.configure_proxy(self._get_proxy_url())
         self._dnf_manager.dump_configuration()
-
-    def _handle_marking_error(self, exn):
-        # FIXME: Move this code outside the payload class.
-        log.error('DNF marking error: %r', exn)
-        if errors.errorHandler.cb(exn) == errors.ERROR_RAISE:
-            # The progress bar polls kind of slowly, thus installation could
-            # still continue for a bit before the quit message is processed.
-            # Doing a sys.exit also ensures the running thread quits before
-            # it can do anything else.
-            progressQ.send_quit(1)
-            util.ipmi_abort(scripts=self.data.scripts)
-            sys.exit(1)
 
     def _sync_metadata(self, dnf_repo):
         try:
@@ -405,50 +320,8 @@ class DNFPayload(Payload):
         return None
 
     ###
-    # METHODS FOR WORKING WITH ENVIRONMENTS
-    ###
-
-    @property
-    def environments(self):
-        return self._dnf_manager.environments
-
-    @property
-    def environment_addons(self):
-        return self._environment_addons
-
-    ###
-    # METHODS FOR WORKING WITH GROUPS
-    ###
-
-    @property
-    def groups(self):
-        groups = self._base.comps.groups_iter()
-        return [g.id for g in groups]
-
-    ###
     # METHODS FOR WORKING WITH REPOSITORIES
     ###
-
-    @property
-    def repos(self):
-        """A list of repo identifiers, not objects themselves."""
-        with self._repos_lock:
-            return [r.id for r in self._base.repos.values()]
-
-    @property
-    def addons(self):
-        """A list of addon repo names."""
-        return [r.name for r in self.data.repo.dataList()]
-
-    @property
-    def _enabled_repos(self):
-        """A list of names of the enabled repos."""
-        enabled = []
-        for repo in self.addons:
-            if self.is_repo_enabled(repo):
-                enabled.append(repo)
-
-        return enabled
 
     def get_addon_repo(self, repo_id):
         """Return a ksdata Repo instance matching the specified repo id."""
@@ -475,7 +348,7 @@ class DNFPayload(Payload):
         """
         if ksrepo.enabled:
             self._add_repo_to_dnf(ksrepo)
-            self._fetch_md(ksrepo.name)
+            self._dnf_manager.load_repository(ksrepo.name)
 
         # Add the repo to the ksdata so it'll appear in the output ks file.
         self.data.repo.dataList().append(ksrepo)
@@ -488,9 +361,9 @@ class DNFPayload(Payload):
         :returns: None
         """
         repo = dnf.repo.Repo(ksrepo.name, self._base.conf)
-        url = self._replace_vars(ksrepo.baseurl)
-        mirrorlist = self._replace_vars(ksrepo.mirrorlist)
-        metalink = self._replace_vars(ksrepo.metalink)
+        url = self._dnf_manager.substitute(ksrepo.baseurl)
+        mirrorlist = self._dnf_manager.substitute(ksrepo.mirrorlist)
+        metalink = self._dnf_manager.substitute(ksrepo.metalink)
 
         if url and url.startswith("nfs://"):
             (server, path) = url[6:].split(":", 1)
@@ -557,27 +430,6 @@ class DNFPayload(Payload):
 
         log.info("added repo: '%s' - %s", ksrepo.name, url or mirrorlist or metalink)
 
-    def _fetch_md(self, repo_name):
-        """Download repo metadata
-
-        :param repo_name: name/id of repo to fetch
-        :type repo_name: str
-        :returns: None
-        """
-        repo = self._base.repos[repo_name]
-        repo.enable()
-        try:
-            # Load the metadata to verify that the repo is valid
-            repo.load()
-        except dnf.exceptions.RepoError as e:
-            repo.disable()
-            log.debug("repo: '%s' - %s failed to load repomd", repo.id,
-                      repo.baseurl or repo.mirrorlist or repo.metalink)
-            raise MetadataError(e) from e
-
-        log.info("enabled repo: '%s' - %s and got repomd", repo.id,
-                 repo.baseurl or repo.mirrorlist or repo.metalink)
-
     def _remove_repo(self, repo_id):
         repos = self.data.repo.dataList()
         try:
@@ -588,7 +440,10 @@ class DNFPayload(Payload):
             repos.pop(idx)
 
     def add_driver_repos(self):
-        """Add driver repositories and packages."""
+        """Add driver repositories and packages.
+
+        FIXME: Don't run this code on every payload restart.
+        """
         # Drivers are loaded by anaconda-dracut, their repos are copied
         # into /run/install/DD-X where X is a number starting at 1. The list of
         # packages that were selected is in /run/install/dd_packages
@@ -609,42 +464,26 @@ class DNFPayload(Payload):
                 log.info("Running createrepo on %s", repo)
                 util.execWithRedirect("createrepo_c", [repo])
 
+            # Generate the repo name.
             repo_name = "DD-%d" % dir_num
-            if repo_name not in self.addons:
-                ks_repo = self.data.RepoData(name=repo_name,
-                                             baseurl="file://" + repo,
-                                             enabled=True)
-                self._add_repo_to_dnf_and_ks(ks_repo)
+
+            # The repo has been already created (#1268357).
+            for ks_repo in self.data.repo.dataList():
+                if repo_name == ks_repo.name:
+                    continue
+
+            # Or create a new one.
+            ks_repo = self.data.RepoData(
+                name=repo_name,
+                baseurl="file://" + repo,
+                enabled=True
+            )
+
+            self._add_repo_to_dnf_and_ks(ks_repo)
 
     @property
     def space_required(self):
         return calculate_required_space(self._dnf_manager)
-
-    def _is_group_visible(self, grpid):
-        grp = self._base.comps.group_by_pattern(grpid)
-        if grp is None:
-            raise NoSuchGroup(grpid)
-        return grp.visible
-
-    def check_software_selection(self):
-        log.info("checking software selection")
-        self._bump_tx_id()
-        self._base.reset(goal=True)
-        self._process_module_command()
-        self._apply_selections()
-
-        try:
-            if self._base.resolve():
-                log.info("checking dependencies: success")
-            else:
-                log.info("empty transaction")
-        except dnf.exceptions.DepsolveError as e:
-            msg = str(e)
-            log.warning(msg)
-            raise DependencyError(msg) from e
-
-        log.info("%d packages selected totalling %s",
-                 len(self._base.transaction), self.space_required)
 
     def set_updates_enabled(self, state):
         """Enable or Disable the repos used to update closest mirror.
@@ -687,99 +526,12 @@ class DNFPayload(Payload):
         if repo:
             repo.enabled = True
 
-    def environment_description(self, environment_id):
-        env = self._base.comps.environment_by_pattern(environment_id)
-
-        if env is None:
-            raise NoSuchGroup(environment_id)
-
-        return (env.ui_name, env.ui_description)
-
-    def environment_id(self, environment):
-        """Return environment id for the environment specified by id or name."""
-        # the enviroment must be string or else DNF >=3 throws an assert error
-        if not isinstance(environment, str):
-            log.warning("environment_id() called with non-string "
-                        "argument: %s", environment)
-
-        env = self._base.comps.environment_by_pattern(environment)
-
-        if env is None:
-            raise NoSuchGroup(environment)
-
-        return env.id
-
-    def environment_has_option(self, environment_id, grpid):
-        env = self._base.comps.environment_by_pattern(environment_id)
-        if env is None:
-            raise NoSuchGroup(environment_id)
-        return grpid in (id_.name for id_ in env.option_ids)
-
-    def environment_option_is_default(self, environment_id, grpid):
-        env = self._base.comps.environment_by_pattern(environment_id)
-        if env is None:
-            raise NoSuchGroup(environment_id)
-
-        # Look for a group in the optionlist that matches the group_id and has
-        # default set
-        return any(grp for grp in env.option_ids if grp.name == grpid and grp.default)
-
-    def group_description(self, grpid):
-        """Return name/description tuple for the group specified by id."""
-        grp = self._base.comps.group_by_pattern(grpid)
-        if grp is None:
-            raise NoSuchGroup(grpid)
-        return (grp.ui_name, grp.ui_description or "")
-
-    def group_id(self, group_name):
-        """Translate group name to group ID.
-
-        :param group_name: Valid identifier for group specification.
-        :returns: Group ID.
-        :raise NoSuchGroup: If group_name doesn't exists.
-        :raise PayloadError: When Yum's groups are not available.
-        """
-        grp = self._base.comps.group_by_pattern(group_name)
-        if grp is None:
-            raise NoSuchGroup(group_name)
-        return grp.id
-
     def gather_repo_metadata(self):
         with self._repos_lock:
             for repo in self._base.repos.iter_enabled():
                 self._sync_metadata(repo)
         self._base.fill_sack(load_system_repo=False)
         self._base.read_comps(arch_filter=True)
-        self._refresh_environment_addons()
-
-    def _refresh_environment_addons(self):
-        log.info("Refreshing environment_addons")
-        self._environment_addons = {}
-
-        for environment in self.environments:
-            self._environment_addons[environment] = ([], [])
-
-            # Determine which groups are specific to this environment and which other groups
-            # are available in this environment.
-            for grp in self.groups:
-                if self.environment_has_option(environment, grp):
-                    self._environment_addons[environment][0].append(grp)
-                elif self._is_group_visible(grp):
-                    self._environment_addons[environment][1].append(grp)
-
-    def pre_install(self):
-        super().pre_install()
-
-        # Collect all package and group requirements.
-        self._collect_requirements()
-
-    def _collect_requirements(self):
-        self._requirements.extend(
-            collect_remote_requirements()
-            + collect_language_requirements(self._base)
-            + collect_platform_requirements(self._base)
-            + collect_driver_disk_requirements()
-        )
 
     def _progress_cb(self, step, message):
         """Callback for task progress reporting."""
@@ -788,14 +540,26 @@ class DNFPayload(Payload):
     def install(self):
         progress_message(N_('Starting package installation process'))
 
-        # Get the packages configuration data.
+        # Get the packages configuration and selection data.
         configuration = self.get_packages_configuration()
+        selection = self.get_packages_selection()
 
         # Add the rpm macros to the global transaction environment
         task = SetRPMMacrosTask(configuration)
         task.run()
 
-        self.check_software_selection()
+        try:
+            # Resolve packages.
+            task = ResolvePackagesTask(self._dnf_manager, selection)
+            task.run()
+        except NonCriticalInstallationError as e:
+            # FIXME: This is a temporary workaround.
+            # Allow users to handle the error. If they don't want
+            # to continue with the installation, raise a different
+            # exception to make sure that we will not run the error
+            # handler again.
+            if error_handler.cb(e) == ERROR_RAISE:
+                raise InstallationError(str(e)) from e
 
         # Set up the download location.
         task = PrepareDownloadLocationTask(self._dnf_manager)
@@ -832,22 +596,6 @@ class DNFPayload(Payload):
             else:
                 return False
 
-    def verify_available_repositories(self):
-        """Verify availability of existing repositories.
-
-        This method tests if URL links from active repositories can be reached.
-        It is useful when network settings is changed so that we can verify if repositories
-        are still reachable.
-        """
-        if not self._repoMD_list:
-            return False
-
-        for repo in self._repoMD_list:
-            if not repo.verify_repoMD():
-                log.debug("Can't reach repo %s", repo.id)
-                return False
-        return True
-
     def _reset_configuration(self):
         tear_down_sources(self.proxy)
         self._reset_additional_repos()
@@ -855,7 +603,6 @@ class DNFPayload(Payload):
         self.tx_id = None
         self._dnf_manager.clear_cache()
         self._dnf_manager.configure_proxy(self._get_proxy_url())
-        self._repoMD_list = []
 
     def _reset_additional_repos(self):
         for name in self._find_mounted_additional_repos():
@@ -970,8 +717,8 @@ class DNFPayload(Payload):
                     sslclientkey=data.ssl_configuration.client_key_path
                 )
                 self._add_repo_to_dnf(base_ksrepo)
-                self._fetch_md(base_ksrepo.name)
-            except (MetadataError, PayloadError) as e:
+                self._dnf_manager.load_repository(base_ksrepo.name)
+            except (DNFManagerError, PayloadError) as e:
                 log.error("base repo (%s/%s) not valid -- removing it",
                           source_type, base_repo_url)
                 log.error("reason for repo removal: %s", e)
@@ -1021,9 +768,7 @@ class DNFPayload(Payload):
                         log.debug("repo %s: fall back enabled from default repos", id_)
                         repo.enable()
 
-        for repo in self.addons:
-            ksrepo = self.get_addon_repo(repo)
-
+        for ksrepo in self.data.repo.dataList():
             if ksrepo.is_harddrive_based():
                 ksrepo.baseurl = self._setup_harddrive_addon_repo(ksrepo)
 
@@ -1050,10 +795,9 @@ class DNFPayload(Payload):
                     self._disable_repo(id_)
 
             # fetch md for enabled repos
-            enabled_repos = self._enabled_repos
-            for repo_name in self.addons:
-                if repo_name in enabled_repos:
-                    self._fetch_md(repo_name)
+            for ks_repo in self.data.repo.dataList():
+                if self.is_repo_enabled(ks_repo.name):
+                    self._dnf_manager.load_repository(ks_repo.name)
 
     def _find_and_mount_iso(self, device, device_mount_dir, iso_path, iso_mount_dir):
         """Find and mount installation source from ISO on device.
@@ -1274,8 +1018,8 @@ class DNFPayload(Payload):
             if base_repo_url is not None:
                 existing_urls.append(base_repo_url)
 
-            for ksrepo in self.addons:
-                baseurl = self.get_addon_repo(ksrepo).baseurl
+            for ks_repo in self.data.repo.dataList():
+                baseurl = ks_repo.baseurl
                 existing_urls.append(baseurl)
 
             enabled_repositories_from_treeinfo = conf.payload.enabled_repositories_from_treeinfo
@@ -1318,15 +1062,14 @@ class DNFPayload(Payload):
         """
         disabled_repo_names = []
 
-        for ks_repo_name in self.addons:
-            repo = self.get_addon_repo(ks_repo_name)
-            if repo.treeinfo_origin:
-                log.debug("Removing old treeinfo repository %s", ks_repo_name)
+        for ks_repo in list(self.data.repo.dataList()):
+            if ks_repo.treeinfo_origin:
+                log.debug("Removing old treeinfo repository %s", ks_repo.name)
 
-                if not repo.enabled:
-                    disabled_repo_names.append(ks_repo_name)
+                if not ks_repo.enabled:
+                    disabled_repo_names.append(ks_repo.name)
 
-                self._remove_repo(ks_repo_name)
+                self._remove_repo(ks_repo.name)
 
         return disabled_repo_names
 
@@ -1382,23 +1125,13 @@ class DNFPayload(Payload):
             if ks_repo.excludepkgs:
                 f.write("exclude=%s\n" % ",".join(ks_repo.excludepkgs))
 
-    def post_setup(self):
-        """Perform post-setup tasks.
-
-        Save repomd hash to test if the repositories can be reached.
-        """
-        self._repoMD_list = []
-        proxy_url = self._get_proxy_url()
-
-        for repo in self._base.repos.iter_enabled():
-            repoMD = RepoMDMetaHash(repo, proxy_url)
-            repoMD.store_repoMD_hash()
-            self._repoMD_list.append(repoMD)
-
     def post_install(self):
         """Perform post-installation tasks."""
         # Write selected kickstart repos to target system
-        for ks_repo in (ks for ks in (self.get_addon_repo(r) for r in self.addons) if ks.install):
+        for ks_repo in self.data.repo.dataList():
+            if not ks_repo.install:
+                continue
+
             if ks_repo.baseurl.startswith("nfs://"):
                 log.info("Skip writing nfs repo %s to target system.", ks_repo.name)
                 continue

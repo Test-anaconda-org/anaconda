@@ -176,10 +176,6 @@ def _prepare_configuration(payload, ksdata):
         # Join a realm. This can run only after network is configured in the target system chroot.
         configuration_queue.append_dbus_tasks(SECURITY, [security_proxy.JoinRealmWithTask()])
 
-    post_scripts = TaskQueue("Post installation scripts", N_("Running post-installation scripts"))
-    post_scripts.append(Task("Run post installation scripts", runPostScripts, (ksdata.scripts,)))
-    configuration_queue.append(post_scripts)
-
     # setup kexec reboot if requested
     if flags.flags.kexec:
         kexec_setup = TaskQueue("Kexec setup", N_("Setting up kexec"))
@@ -203,6 +199,17 @@ def _prepare_configuration(payload, ksdata):
     # only add write_configs to the main queue if we actually store some kickstarts/configs
     if write_configs.task_count:
         configuration_queue.append(write_configs)
+
+    post_scripts = TaskQueue(
+        "Post installation scripts",
+        N_("Running post-installation scripts")
+    )
+    post_scripts.append(Task(
+        "Run post installation scripts",
+        runPostScripts,
+        (ksdata.scripts,)
+    ))
+    configuration_queue.append(post_scripts)
 
     return configuration_queue
 
@@ -250,6 +257,15 @@ def _prepare_installation(payload, ksdata):
     for service_name, object_path in boss_proxy.CollectConfigureRuntimeTasks():
         task_proxy = DBus.get_proxy(service_name, object_path)
         setup_environment.append(DBusTask(task_proxy))
+
+    # Add configuration tasks for the Localization DBus module.
+    if is_module_available(LOCALIZATION):
+        localization_proxy = LOCALIZATION.get_proxy()
+        # Populate the missing keyboard values before the payload installation,
+        # so the module requirements can be generated for the right configuration.
+        # FIXME: Make sure that the module always returns right values.
+        populate_task = localization_proxy.PopulateMissingKeyboardConfigurationWithTask()
+        setup_environment.append_dbus_tasks(LOCALIZATION, [populate_task])
 
     installation_queue.append(setup_environment)
 

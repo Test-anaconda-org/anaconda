@@ -103,6 +103,11 @@ class StorageSpoke(NormalTUISpoke):
 
         self._available_disks = []
         self._selected_disks = []
+
+        # Is the partitioning already configured?
+        self._is_preconfigured = bool(self._storage_module.CreatedPartitioning)
+
+        # Find a partitioning to use.
         self._partitioning = find_partitioning()
 
         self.errors = []
@@ -183,16 +188,15 @@ class StorageSpoke(NormalTUISpoke):
         # Get the available selected disks.
         self._selected_disks = filter_disks_by_names(self._available_disks, self._selected_disks)
 
+        # Get the available partitioning.
+        object_path = self._storage_module.CreatedPartitioning[-1]
+        self._partitioning = STORAGE.get_proxy(object_path)
+
         return True
 
     def refresh(self, args=None):
         """Prepare the content of the screen."""
         super().refresh(args)
-        threadMgr.wait(THREAD_STORAGE_WATCHER)
-
-        # Get the available partitioning.
-        object_path = self._storage_module.CreatedPartitioning[-1]
-        self._partitioning = STORAGE.get_proxy(object_path)
 
         # Create a new container.
         self._container = ListColumnContainer(1, spacing=1)
@@ -414,8 +418,8 @@ class StorageSpoke(NormalTUISpoke):
         # Update the selected disks.
         select_default_disks()
 
-        # Apply the partitioning in the automated installation.
-        if flags.automatedInstall:
+        # Automatically apply the preconfigured partitioning.
+        if flags.automatedInstall and self._is_preconfigured:
             self.execute()
 
         # Storage is ready.
@@ -423,6 +427,13 @@ class StorageSpoke(NormalTUISpoke):
 
         # Report that the storage spoke has been initialized.
         self.initialize_done()
+
+    def closed(self):
+        """The spoke has been closed."""
+        super().closed()
+
+        # Run the setup method again on entry.
+        self.screen_ready = False
 
 
 class PartTypeSpoke(NormalTUISpoke):

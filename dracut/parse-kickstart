@@ -157,7 +157,7 @@ class DracutURL(Url, DracutArgsMixin):
         if self.noverifyssl:
             args.append("rd.noverifyssl")
         if self.proxy:
-            args.append("proxy=%s" % self.proxy)
+            args.append("inst.proxy=%s" % self.proxy)
 
         return "\n".join(args)
 
@@ -249,7 +249,7 @@ class DracutDisplayMode(DisplayMode, DracutArgsMixin):
 class DracutBootloader(Bootloader, DracutArgsMixin):
     def dracut_args(self, args, lineno, obj):
         if self.extlinux:
-            return "extlinux"
+            return "inst.extlinux"
 
 # FUTURE: keymap, lang... device? selinux?
 
@@ -389,6 +389,9 @@ def ksnet_to_dracut(args, lineno, net, bootdev=False):
                       " ".join(args))
     if net.bridgeslaves:
         line.append("bridge=%s:%s" % (net.device, net.bridgeslaves))
+
+    if net.bondslaves:
+        line.append("bond=%s:%s:%s:%s" % (net.device, net.bondslaves, net.bondopts, net.mtu))
 
     return " ".join(line)
 
